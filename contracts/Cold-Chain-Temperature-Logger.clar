@@ -5,6 +5,9 @@
 (define-constant ERR-SHIPMENT-COMPLETED (err u410))
 (define-constant ERR-INVALID-STATUS (err u411))
 (define-constant ERR-TEMPERATURE-VIOLATION (err u412))
+(define-constant ERR-ALERT-NOT-FOUND (err u413))
+(define-constant ERR-ALERT-ALREADY-EXISTS (err u414))
+(define-constant ERR-INVALID-ALERT-TYPE (err u415))
 
 (define-constant MIN-TEMP -30)
 (define-constant MAX-TEMP 10)
@@ -49,6 +52,41 @@
     { authorized: bool }
 )
 
+(define-map alert-rules
+    {
+        shipment-id: (string-ascii 32),
+        alert-id: (string-ascii 20),
+    }
+    {
+        alert-type: (string-ascii 20),
+        threshold-value: uint,
+        is-active: bool,
+        created-by: principal,
+        created-at: uint,
+        triggered-count: uint,
+        last-triggered: (optional uint),
+    }
+)
+
+(define-map active-alerts
+    {
+        shipment-id: (string-ascii 32),
+        alert-id: (string-ascii 20),
+    }
+    {
+        severity: (string-ascii 10),
+        message: (string-ascii 100),
+        triggered-at: uint,
+        acknowledged: bool,
+        acknowledged-by: (optional principal),
+    }
+)
+
+(define-map shipment-alert-counter
+    { shipment-id: (string-ascii 32) }
+    { counter: uint }
+)
+
 (define-read-only (get-contract-owner)
     (var-get contract-owner)
 )
@@ -56,6 +94,43 @@
 (define-read-only (is-authorized-logger (logger principal))
     (default-to false
         (get authorized (map-get? authorized-loggers { logger: logger }))
+    )
+)
+
+(define-read-only (get-alert-rule
+        (shipment-id (string-ascii 32))
+        (alert-id (string-ascii 20))
+    )
+    (map-get? alert-rules {
+        shipment-id: shipment-id,
+        alert-id: alert-id,
+    })
+)
+
+(define-read-only (get-active-alert
+        (shipment-id (string-ascii 32))
+        (alert-id (string-ascii 20))
+    )
+    (map-get? active-alerts {
+        shipment-id: shipment-id,
+        alert-id: alert-id,
+    })
+)
+
+(define-read-only (get-shipment-alert-count (shipment-id (string-ascii 32)))
+    (default-to u0
+        (get counter
+            (map-get? shipment-alert-counter { shipment-id: shipment-id })
+        ))
+)
+
+(define-read-only (is-alert-active
+        (shipment-id (string-ascii 32))
+        (alert-id (string-ascii 20))
+    )
+    (match (get-alert-rule shipment-id alert-id)
+        rule-data (get is-active rule-data)
+        false
     )
 )
 
@@ -140,6 +215,150 @@
     (begin
         (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
         (map-set authorized-loggers { logger: logger } { authorized: false })
+        (ok true)
+    )
+)
+
+(define-public (create-alert-rule
+        (shipment-id (string-ascii 32))
+        (alert-id (string-ascii 20))
+        (alert-type (string-ascii 20))
+        (threshold-value uint)
+    )
+    (let ((shipment-data (unwrap! (get-shipment shipment-id) ERR-SHIPMENT-NOT-FOUND)))
+        (asserts!
+            (or
+                (is-eq tx-sender (get owner shipment-data))
+                (is-eq tx-sender (var-get contract-owner))
+            )
+            ERR-NOT-AUTHORIZED
+        )
+        (asserts! (is-none (get-alert-rule shipment-id alert-id))
+            ERR-ALERT-ALREADY-EXISTS
+        )
+        (asserts!
+            (or
+                (is-eq alert-type "temp-violation")
+                (is-eq alert-type "duration-limit")
+                (is-eq alert-type "compliance-risk")
+                (is-eq alert-type "trend-warning")
+            )
+            ERR-INVALID-ALERT-TYPE
+        )
+        (map-set alert-rules {
+            shipment-id: shipment-id,
+            alert-id: alert-id,
+        } {
+            alert-type: alert-type,
+            threshold-value: threshold-value,
+            is-active: true,
+            created-by: tx-sender,
+            created-at: stacks-block-height,
+            triggered-count: u0,
+            last-triggered: none,
+        })
+        (let ((current-count (get-shipment-alert-count shipment-id)))
+            (if (is-eq current-count u0)
+                (map-set shipment-alert-counter { shipment-id: shipment-id } { counter: u1 })
+                (map-set shipment-alert-counter { shipment-id: shipment-id } { counter: (+ current-count u1) })
+            )
+        )
+        (ok true)
+    )
+)
+
+(define-public (toggle-alert-rule
+        (shipment-id (string-ascii 32))
+        (alert-id (string-ascii 20))
+        (active bool)
+    )
+    (let (
+            (shipment-data (unwrap! (get-shipment shipment-id) ERR-SHIPMENT-NOT-FOUND))
+            (rule-data (unwrap! (get-alert-rule shipment-id alert-id) ERR-ALERT-NOT-FOUND))
+        )
+        (asserts!
+            (or
+                (is-eq tx-sender (get owner shipment-data))
+                (is-eq tx-sender (var-get contract-owner))
+            )
+            ERR-NOT-AUTHORIZED
+        )
+        (map-set alert-rules {
+            shipment-id: shipment-id,
+            alert-id: alert-id,
+        }
+            (merge rule-data { is-active: active })
+        )
+        (ok true)
+    )
+)
+
+(define-public (trigger-alert
+        (shipment-id (string-ascii 32))
+        (alert-id (string-ascii 20))
+        (severity (string-ascii 10))
+        (message (string-ascii 100))
+    )
+    (let (
+            (rule-data (unwrap! (get-alert-rule shipment-id alert-id) ERR-ALERT-NOT-FOUND))
+            (shipment-data (unwrap! (get-shipment shipment-id) ERR-SHIPMENT-NOT-FOUND))
+        )
+        (asserts!
+            (or
+                (is-authorized-logger tx-sender)
+                (is-eq tx-sender (get owner shipment-data))
+                (is-eq tx-sender (var-get contract-owner))
+            )
+            ERR-NOT-AUTHORIZED
+        )
+        (asserts! (get is-active rule-data) ERR-INVALID-STATUS)
+        (map-set active-alerts {
+            shipment-id: shipment-id,
+            alert-id: alert-id,
+        } {
+            severity: severity,
+            message: message,
+            triggered-at: stacks-block-height,
+            acknowledged: false,
+            acknowledged-by: none,
+        })
+        (map-set alert-rules {
+            shipment-id: shipment-id,
+            alert-id: alert-id,
+        }
+            (merge rule-data {
+                triggered-count: (+ (get triggered-count rule-data) u1),
+                last-triggered: (some stacks-block-height),
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (acknowledge-alert
+        (shipment-id (string-ascii 32))
+        (alert-id (string-ascii 20))
+    )
+    (let (
+            (alert-data (unwrap! (get-active-alert shipment-id alert-id) ERR-ALERT-NOT-FOUND))
+            (shipment-data (unwrap! (get-shipment shipment-id) ERR-SHIPMENT-NOT-FOUND))
+        )
+        (asserts!
+            (or
+                (is-eq tx-sender (get owner shipment-data))
+                (is-authorized-logger tx-sender)
+            )
+            ERR-NOT-AUTHORIZED
+        )
+        (map-set active-alerts {
+            shipment-id: shipment-id,
+            alert-id: alert-id,
+        }
+            (merge alert-data {
+                acknowledged: true,
+                acknowledged-by: (some tx-sender),
+            })
+        )
         (ok true)
     )
 )
@@ -570,5 +789,124 @@
         (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
         (asserts! (< cutoff-block stacks-block-height) ERR-INVALID-STATUS)
         (ok true)
+    )
+)
+
+(define-read-only (get-shipment-alert-summary (shipment-id (string-ascii 32)))
+    (let ((shipment-data (unwrap! (get-shipment shipment-id) ERR-SHIPMENT-NOT-FOUND)))
+        (ok {
+            total-alert-rules: (get-shipment-alert-count shipment-id),
+            violation-count: (get violation-count shipment-data),
+            shipment-status: (get status shipment-data),
+            monitoring-duration: (match (get end-block shipment-data)
+                end-block (- end-block (get start-block shipment-data))
+                (- stacks-block-height (get start-block shipment-data))
+            ),
+        })
+    )
+)
+
+(define-read-only (check-alert-conditions (shipment-id (string-ascii 32)))
+    (let (
+            (shipment-data (unwrap! (get-shipment shipment-id) ERR-SHIPMENT-NOT-FOUND))
+            (violations (get violation-count shipment-data))
+            (log-count (get-shipment-log-count shipment-id))
+            (duration (- stacks-block-height (get start-block shipment-data)))
+        )
+        (ok {
+            should-alert-violations: (> violations VIOLATION-THRESHOLD),
+            should-alert-duration: (> duration u1000),
+            should-alert-compliance: (and (> log-count u0) (> (/ (* violations u100) log-count) u20)),
+            current-violations: violations,
+            current-duration: duration,
+            compliance-score: (if (> log-count u0)
+                (- u100 (/ (* violations u100) log-count))
+                u100
+            ),
+        })
+    )
+)
+
+(define-read-only (get-unacknowledged-alerts-count (shipment-id (string-ascii 32)))
+    (ok u0)
+)
+
+(define-read-only (evaluate-temperature-trends (shipment-id (string-ascii 32)))
+    (let (
+            (shipment-data (unwrap! (get-shipment shipment-id) ERR-SHIPMENT-NOT-FOUND))
+            (latest-temp (get-latest-temperature shipment-id))
+            (violations (get violation-count shipment-data))
+        )
+        (ok {
+            has-recent-data: (is-some latest-temp),
+            trend-concerning: (> violations u3),
+            requires-attention: (and
+                (is-eq (get status shipment-data) "active")
+                (> violations u1)
+            ),
+            temperature-stability: (if (<= violations u1)
+                "stable"
+                "unstable"
+            ),
+        })
+    )
+)
+
+(define-public (auto-check-and-trigger-alerts (shipment-id (string-ascii 32)))
+    (let (
+            (shipment-data (unwrap! (get-shipment shipment-id) ERR-SHIPMENT-NOT-FOUND))
+            (conditions (unwrap-panic (check-alert-conditions shipment-id)))
+        )
+        (asserts!
+            (or
+                (is-authorized-logger tx-sender)
+                (is-eq tx-sender (var-get contract-owner))
+            )
+            ERR-NOT-AUTHORIZED
+        )
+        (asserts! (is-eq (get status shipment-data) "active")
+            ERR-SHIPMENT-COMPLETED
+        )
+        (if (get should-alert-violations conditions)
+            (begin
+                (unwrap-panic (trigger-alert shipment-id "violation-alert" "high"
+                    "Temperature violations exceeded threshold"
+                ))
+                (ok {
+                    violations-triggered: true,
+                    duration-triggered: false,
+                    compliance-triggered: false,
+                })
+            )
+            (if (get should-alert-duration conditions)
+                (begin
+                    (unwrap-panic (trigger-alert shipment-id "duration-alert" "medium"
+                        "Shipment duration exceeds normal limits"
+                    ))
+                    (ok {
+                        violations-triggered: false,
+                        duration-triggered: true,
+                        compliance-triggered: false,
+                    })
+                )
+                (if (get should-alert-compliance conditions)
+                    (begin
+                        (unwrap-panic (trigger-alert shipment-id "compliance-alert" "high"
+                            "Compliance score below acceptable threshold"
+                        ))
+                        (ok {
+                            violations-triggered: false,
+                            duration-triggered: false,
+                            compliance-triggered: true,
+                        })
+                    )
+                    (ok {
+                        violations-triggered: false,
+                        duration-triggered: false,
+                        compliance-triggered: false,
+                    })
+                )
+            )
+        )
     )
 )
